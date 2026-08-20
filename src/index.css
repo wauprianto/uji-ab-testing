@@ -1,0 +1,65 @@
+@import "tailwindcss";
+
+@theme {
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+
+  --color-ink: #14171c;
+  --color-paper: #1c2029;
+  --color-paper-raised: #232833;
+  --color-line: #2c3240;
+
+  --color-control: #5b8def;
+  --color-control-dim: #5b8def33;
+  --color-variant: #f0a857;
+  --color-variant-dim: #f0a85733;
+  --color-signal: #4ade80;
+  --color-signal-dim: #4ade8033;
+  --color-noise: #f45d5d;
+  --color-noise-dim: #f45d5d33;
+
+  --color-text: #e8eaed;
+  --color-text-muted: #8b92a3;
+  --color-text-faint: #565d6d;
+}
+
+html {
+  background: var(--color-ink);
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-ink);
+  color: var(--color-text);
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+::selection {
+  background: var(--color-control-dim);
+  color: var(--color-text);
+}
+
+.bg-labgrid {
+  background-image:
+    linear-gradient(var(--color-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-line) 1px, transparent 1px);
+  background-size: 32px 32px;
+  background-position: -1px -1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--color-ink); }
+::-webkit-scrollbar-thumb { background: var(--color-line); border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-text-faint); }
