@@ -3,11 +3,13 @@ import Papa from "papaparse";
 import {
   FlaskConical, Calculator, Target, Upload, History, LogOut,
   ChevronRight, ChevronDown, Trash2, AlertCircle, CheckCircle2,
-  Loader2, Save, X,
+  Loader2, Save, X, Plus, Minus, TrendingUp,
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient";
 import {
   twoProportionZTest, welchTTest, sampleSizeForProportion, summarizeRawData,
+  chiSquareTest, oneWayANOVA, mannWhitneyU, bayesianProportionTest,
+  betaPDF, normalPDF,
 } from "./lib/stats";
 
 // ============================================================================
@@ -39,14 +41,14 @@ function TextInput(props) {
 
 function Segmented({ options, value, onChange }) {
   return (
-    <div className="inline-flex rounded-lg border border-line bg-paper p-1">
+    <div className="no-scrollbar inline-flex min-w-0 max-w-full gap-0 overflow-x-auto rounded-lg border border-line bg-paper p-1">
       {options.map((opt) => (
         <button
           key={opt.value}
           type="button"
           onClick={() => onChange(opt.value)}
           className={
-            "rounded-md px-3 py-1.5 text-sm font-medium transition-colors " +
+            "shrink-0 whitespace-nowrap rounded-md px-3 py-1.5 text-sm font-medium transition-colors " +
             (value === opt.value
               ? "bg-paper-raised text-text shadow-sm ring-1 ring-line"
               : "text-text-muted hover:text-text")
@@ -146,7 +148,141 @@ function CompareBars({ v1, v2, format }) {
   );
 }
 
-// Renders a proportion-test or continuous-test result identically wherever it's used.
+function normalCurvePoints(m, sd, n = 60) {
+  const points = [];
+  const lo = m - 4 * sd, hi = m + 4 * sd;
+  for (let i = 0; i <= n; i++) {
+    const x = lo + ((hi - lo) * i) / n;
+    points.push({ x, y: normalPDF(x, m, sd) });
+  }
+  return points;
+}
+
+// Wilson score interval — more reliable than the plain Wald interval for
+// proportions, especially with smaller samples.
+function wilsonCI(p, n, z = 1.96) {
+  const denom = 1 + (z * z) / n;
+  const center = (p + (z * z) / (2 * n)) / denom;
+  const margin = (z / denom) * Math.sqrt((p * (1 - p)) / n + (z * z) / (4 * n * n));
+  return [Math.max(0, center - margin), Math.min(1, center + margin)];
+}
+
+// ============================================================================
+// CHART PRIMITIVES — plain SVG, no charting library. Kept consistent with the
+// control (blue) / variant (amber) duotone used everywhere else.
+// ============================================================================
+const CHART_W = 400, CHART_H = 160, PAD_L = 8, PAD_R = 8, PAD_T = 10, PAD_B = 22;
+
+function pathFromPoints(points) {
+  return points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(2)},${p.y.toFixed(2)}`).join(" ");
+}
+
+// Overlaid curves for control vs variant — either normal approximations
+// (frequentist) or actual Beta posteriors (Bayesian).
+function DistributionChart({ curves, xFormat }) {
+  const innerW = CHART_W - PAD_L - PAD_R;
+  const innerH = CHART_H - PAD_T - PAD_B;
+  const xMin = Math.min(...curves.flatMap((c) => c.points.map((p) => p.x)));
+  const xMax = Math.max(...curves.flatMap((c) => c.points.map((p) => p.x)));
+  const yMax = Math.max(...curves.flatMap((c) => c.points.map((p) => p.y))) * 1.08 || 1;
+
+  const sx = (x) => PAD_L + ((x - xMin) / (xMax - xMin || 1)) * innerW;
+  const sy = (y) => PAD_T + innerH - (y / yMax) * innerH;
+
+  return (
+    <svg viewBox={`0 0 ${CHART_W} ${CHART_H}`} className="w-full" style={{ height: 170 }}>
+      <line x1={PAD_L} y1={PAD_T + innerH} x2={CHART_W - PAD_R} y2={PAD_T + innerH} stroke="var(--color-line)" strokeWidth="1" />
+      {curves.map((c) => {
+        const pts = c.points.map((p) => ({ x: sx(p.x), y: sy(p.y) }));
+        const areaPts = [{ x: pts[0].x, y: sy(0) }, ...pts, { x: pts[pts.length - 1].x, y: sy(0) }];
+        return (
+          <g key={c.label}>
+            <path d={pathFromPoints(areaPts) + " Z"} fill={c.color} opacity="0.14" />
+            <path d={pathFromPoints(pts)} fill="none" stroke={c.color} strokeWidth="2" />
+          </g>
+        );
+      })}
+      <text x={PAD_L} y={CHART_H - 4} fontSize="9" fontFamily="var(--font-mono)" fill="var(--color-text-faint)">
+        {xFormat ? xFormat(xMin) : xMin.toFixed(2)}
+      </text>
+      <text x={CHART_W - PAD_R} y={CHART_H - 4} fontSize="9" fontFamily="var(--font-mono)" fill="var(--color-text-faint)" textAnchor="end">
+        {xFormat ? xFormat(xMax) : xMax.toFixed(2)}
+      </text>
+      {curves.map((c, i) => (
+        <g key={c.label} transform={`translate(${PAD_L + i * 90}, ${PAD_T})`}>
+          <rect width="8" height="8" rx="2" fill={c.color} />
+          <text x="12" y="8" fontSize="10" fontFamily="var(--font-mono)" fill="var(--color-text-muted)">{c.label}</text>
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+// Horizontal bars with a point estimate + confidence/credible interval whiskers —
+// one row per group, works for 2 groups or many (multi-variant tests).
+function ForestPlot({ rows, xFormat }) {
+  const rowH = 34;
+  const height = rows.length * rowH + PAD_T + 20;
+  const labelW = 84;
+  const innerW = CHART_W - labelW - PAD_R - 10;
+  const xMin = Math.min(...rows.map((r) => r.ci[0]), ...rows.map(r=>r.estimate));
+  const xMax = Math.max(...rows.map((r) => r.ci[1]), ...rows.map(r=>r.estimate));
+  const pad = (xMax - xMin) * 0.15 || 0.01;
+  const domainMin = xMin - pad, domainMax = xMax + pad;
+  const sx = (x) => labelW + ((x - domainMin) / (domainMax - domainMin || 1)) * innerW;
+
+  return (
+    <svg viewBox={`0 0 ${CHART_W} ${height}`} className="w-full" style={{ height: height * 0.85 }}>
+      {rows.map((r, i) => {
+        const y = PAD_T + i * rowH + rowH / 2;
+        return (
+          <g key={r.label}>
+            <text x={0} y={y + 3} fontSize="10" fontFamily="var(--font-mono)" fill="var(--color-text-muted)">
+              {r.label.length > 12 ? r.label.slice(0, 11) + "…" : r.label}
+            </text>
+            <line x1={sx(r.ci[0])} y1={y} x2={sx(r.ci[1])} y2={y} stroke={r.color} strokeWidth="2" opacity="0.6" />
+            <line x1={sx(r.ci[0])} y1={y - 4} x2={sx(r.ci[0])} y2={y + 4} stroke={r.color} strokeWidth="2" opacity="0.6" />
+            <line x1={sx(r.ci[1])} y1={y - 4} x2={sx(r.ci[1])} y2={y + 4} stroke={r.color} strokeWidth="2" opacity="0.6" />
+            <circle cx={sx(r.estimate)} cy={y} r="4" fill={r.color} />
+            <text x={sx(r.estimate)} y={y - 9} fontSize="9" fontFamily="var(--font-mono)" fill="var(--color-text)" textAnchor="middle">
+              {xFormat ? xFormat(r.estimate) : r.estimate.toFixed(3)}
+            </text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+// Dot/strip plot of raw values along a number line — used for the
+// non-parametric test since Mann-Whitney makes no distributional assumption,
+// so showing the actual points (not a fitted curve) is the honest choice.
+function StripPlot({ control, variant }) {
+  const all = [...control, ...variant];
+  const min = Math.min(...all), max = Math.max(...all);
+  const pad = (max - min) * 0.08 || 1;
+  const domainMin = min - pad, domainMax = max + pad;
+  const innerW = CHART_W - PAD_L - PAD_R;
+  const sx = (x) => PAD_L + ((x - domainMin) / (domainMax - domainMin || 1)) * innerW;
+  const rowY = { control: 34, variant: 74 };
+
+  return (
+    <svg viewBox={`0 0 ${CHART_W} 100`} className="w-full" style={{ height: 100 }}>
+      <line x1={PAD_L} y1={rowY.control} x2={CHART_W - PAD_R} y2={rowY.control} stroke="var(--color-line)" strokeWidth="1" />
+      <line x1={PAD_L} y1={rowY.variant} x2={CHART_W - PAD_R} y2={rowY.variant} stroke="var(--color-line)" strokeWidth="1" />
+      <text x={PAD_L} y={rowY.control - 8} fontSize="9" fontFamily="var(--font-mono)" fill="var(--color-control)">CONTROL</text>
+      <text x={PAD_L} y={rowY.variant - 8} fontSize="9" fontFamily="var(--font-mono)" fill="var(--color-variant)">VARIANT</text>
+      {control.map((v, i) => (
+        <circle key={"c" + i} cx={sx(v)} cy={rowY.control} r="3.5" fill="var(--color-control)" opacity="0.75" />
+      ))}
+      {variant.map((v, i) => (
+        <circle key={"v" + i} cx={sx(v)} cy={rowY.variant} r="3.5" fill="var(--color-variant)" opacity="0.75" />
+      ))}
+    </svg>
+  );
+}
+
+
 function ResultPanel({ result }) {
   if (!result) return null;
   const isProp = result.testType === "proportion";
@@ -199,6 +335,35 @@ function ResultPanel({ result }) {
         />
       </div>
 
+      <div className="grid gap-4 border-t border-line pt-4 sm:grid-cols-2">
+        <div>
+          <div className="mb-1.5 text-xs font-mono uppercase tracking-wider text-text-muted">Distribusi (Aproksimasi Normal)</div>
+          <DistributionChart
+            xFormat={(v) => (isProp ? `${(v * 100).toFixed(1)}%` : v.toFixed(1))}
+            curves={[
+              { label: "Control", color: "var(--color-control)", points: normalCurvePoints(isProp ? result.p1 : result.m1, isProp ? Math.sqrt(result.p1 * (1 - result.p1) / result.n1) : result.sd1 / Math.sqrt(result.n1)) },
+              { label: "Variant", color: "var(--color-variant)", points: normalCurvePoints(isProp ? result.p2 : result.m2, isProp ? Math.sqrt(result.p2 * (1 - result.p2) / result.n2) : result.sd2 / Math.sqrt(result.n2)) },
+            ]}
+          />
+        </div>
+        <div>
+          <div className="mb-1.5 text-xs font-mono uppercase tracking-wider text-text-muted">Estimasi & CI</div>
+          <ForestPlot
+            xFormat={(v) => (isProp ? `${(v * 100).toFixed(1)}%` : v.toFixed(1))}
+            rows={(() => {
+              const est1 = isProp ? result.p1 : result.m1;
+              const est2 = isProp ? result.p2 : result.m2;
+              const ci1 = isProp ? wilsonCI(result.p1, result.n1) : [est1 - 1.96 * result.sd1 / Math.sqrt(result.n1), est1 + 1.96 * result.sd1 / Math.sqrt(result.n1)];
+              const ci2 = isProp ? wilsonCI(result.p2, result.n2) : [est2 - 1.96 * result.sd2 / Math.sqrt(result.n2), est2 + 1.96 * result.sd2 / Math.sqrt(result.n2)];
+              return [
+                { label: "Control", estimate: est1, ci: ci1, color: "var(--color-control)" },
+                { label: "Variant", estimate: est2, ci: ci2, color: "var(--color-variant)" },
+              ];
+            })()}
+          />
+        </div>
+      </div>
+
       <p className="border-t border-line pt-3 text-xs leading-relaxed text-text-faint">
         {result.significant
           ? `Perbedaan antara control dan variant kemungkinan besar bukan kebetulan (p < α = ${result.alpha}). Cukup bukti untuk menolak hipotesis nol.`
@@ -208,9 +373,241 @@ function ResultPanel({ result }) {
   );
 }
 
-// ============================================================================
-// AUTH SCREEN
-// ============================================================================
+// Multi-variant result panel — shared by chi-square (proportion) and ANOVA (continuous)
+function MultiVariantResultPanel({ result }) {
+  const isChiSq = result.testType === "chisquare";
+  const palette = ["var(--color-control)", "var(--color-variant)", "#a78bfa", "#f472b6", "#34d399", "#fbbf24"];
+  const rows = result.groups.map((g, i) => ({
+    label: g.name,
+    estimate: isChiSq ? g.rate : g.mean,
+    ci: g.ci,
+    color: palette[i % palette.length],
+  }));
+
+  return (
+    <div className="space-y-5 rounded-xl border border-line bg-paper p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="text-xs font-mono uppercase tracking-wider text-text-muted">
+            {isChiSq ? "Chi-Square Test of Independence" : "One-Way ANOVA"}
+          </div>
+          <div className="mt-1 font-mono text-3xl font-bold text-text">
+            p = {result.pValue < 0.0001 ? result.pValue.toExponential(2) : result.pValue.toFixed(4)}
+          </div>
+        </div>
+        <Badge signal={result.significant}>{result.significant ? "Signifikan" : "Tidak Signifikan"}</Badge>
+      </div>
+
+      <SignificanceMeter pValue={result.pValue} alpha={result.alpha} />
+
+      <div className="grid grid-cols-3 gap-4 border-t border-line pt-4">
+        <div>
+          <div className="text-xs font-mono uppercase text-text-muted">{isChiSq ? "χ²" : "F-stat"}</div>
+          <div className="font-mono text-lg text-text">{(isChiSq ? result.chiSq : result.F).toFixed(3)}</div>
+        </div>
+        <div>
+          <div className="text-xs font-mono uppercase text-text-muted">df</div>
+          <div className="font-mono text-lg text-text">{isChiSq ? result.df : `${result.dfBetween}, ${result.dfWithin}`}</div>
+        </div>
+        <div>
+          <div className="text-xs font-mono uppercase text-text-muted">Grup</div>
+          <div className="font-mono text-lg text-text">{result.groups.length}</div>
+        </div>
+      </div>
+
+      <div>
+        <div className="mb-1.5 text-xs font-mono uppercase tracking-wider text-text-muted">Perbandingan Antar Grup (dengan CI 95%)</div>
+        <ForestPlot rows={rows} xFormat={(v) => (isChiSq ? `${(v * 100).toFixed(1)}%` : v.toFixed(1))} />
+      </div>
+
+      <div className="overflow-x-auto border-t border-line pt-3">
+        <table className="w-full text-left text-xs">
+          <thead>
+            <tr className="text-text-muted">
+              <th className="pb-2 font-mono font-normal uppercase">Grup</th>
+              {isChiSq ? (
+                <>
+                  <th className="pb-2 font-mono font-normal uppercase">Konversi</th>
+                  <th className="pb-2 font-mono font-normal uppercase">Rate</th>
+                </>
+              ) : (
+                <>
+                  <th className="pb-2 font-mono font-normal uppercase">n</th>
+                  <th className="pb-2 font-mono font-normal uppercase">Mean</th>
+                  <th className="pb-2 font-mono font-normal uppercase">SD</th>
+                </>
+              )}
+            </tr>
+          </thead>
+          <tbody className="font-mono text-text">
+            {result.groups.map((g) => (
+              <tr key={g.name} className="border-t border-line/50">
+                <td className="py-1.5">{g.name}</td>
+                {isChiSq ? (
+                  <>
+                    <td className="py-1.5">{g.conversions}/{g.total}</td>
+                    <td className="py-1.5">{(g.rate * 100).toFixed(2)}%</td>
+                  </>
+                ) : (
+                  <>
+                    <td className="py-1.5">{g.n}</td>
+                    <td className="py-1.5">{g.mean.toFixed(2)}</td>
+                    <td className="py-1.5">{g.sd.toFixed(2)}</td>
+                  </>
+                )}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="border-t border-line pt-3 text-xs leading-relaxed text-text-faint">
+        {result.significant
+          ? `Ada perbedaan signifikan di antara ${result.groups.length} grup ini (p < α = ${result.alpha}). ${isChiSq ? "Chi-square" : "ANOVA"} cuma bilang "ada beda", untuk tau grup mana vs mana lakukan uji lanjutan (post-hoc) atau bandingkan 2 grup langsung di tab Uji Proporsi/Rata-rata.`
+          : `Belum cukup bukti ada perbedaan nyata di antara grup-grup ini (p ≥ α = ${result.alpha}).`}
+      </p>
+    </div>
+  );
+}
+
+function MannWhitneyResultPanel({ result }) {
+  return (
+    <div className="space-y-5 rounded-xl border border-line bg-paper p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="text-xs font-mono uppercase tracking-wider text-text-muted">Mann-Whitney U (Non-Parametrik)</div>
+          <div className="mt-1 font-mono text-3xl font-bold text-text">
+            p = {result.pValue < 0.0001 ? result.pValue.toExponential(2) : result.pValue.toFixed(4)}
+          </div>
+        </div>
+        <Badge signal={result.significant}>{result.significant ? "Signifikan" : "Tidak Signifikan"}</Badge>
+      </div>
+
+      <SignificanceMeter pValue={result.pValue} alpha={result.alpha} />
+
+      <div className="grid grid-cols-2 gap-4 border-t border-line pt-4 sm:grid-cols-4">
+        <div>
+          <div className="text-xs font-mono uppercase text-text-muted">U-statistic</div>
+          <div className="font-mono text-lg text-text">{result.U.toFixed(1)}</div>
+        </div>
+        <div>
+          <div className="text-xs font-mono uppercase text-text-muted">z-score</div>
+          <div className="font-mono text-lg text-text">{result.z.toFixed(3)}</div>
+        </div>
+        <div>
+          <div className="text-xs font-mono uppercase text-text-muted">Median Control</div>
+          <div className="font-mono text-lg text-control">{result.medianControl.toFixed(2)}</div>
+        </div>
+        <div>
+          <div className="text-xs font-mono uppercase text-text-muted">Median Variant</div>
+          <div className="font-mono text-lg text-variant">{result.medianVariant.toFixed(2)}</div>
+        </div>
+      </div>
+
+      <div>
+        <div className="mb-1.5 text-xs font-mono uppercase tracking-wider text-text-muted">Sebaran Data Aktual (bukan kurva — sesuai prinsip non-parametrik)</div>
+        <StripPlot control={result.control} variant={result.variant} />
+      </div>
+
+      <p className="border-t border-line pt-3 text-xs leading-relaxed text-text-faint">
+        Mann-Whitney U membandingkan <em>ranking/urutan</em> data, bukan rata-rata — cocok dipakai kalau data
+        tidak berdistribusi normal atau ada outlier ekstrem. {result.significant
+          ? `Ranking kedua grup berbeda signifikan (p < α = ${result.alpha}).`
+          : `Belum cukup bukti perbedaan ranking antar grup (p ≥ α = ${result.alpha}).`}
+      </p>
+    </div>
+  );
+}
+
+function BayesianResultPanel({ result }) {
+  const probPct = result.probVariantBeatsControl * 100;
+  const curves = [
+    { label: "Control", color: "var(--color-control)", points: betaCurvePoints(result.posteriorControl.a, result.posteriorControl.b) },
+    { label: "Variant", color: "var(--color-variant)", points: betaCurvePoints(result.posteriorVariant.a, result.posteriorVariant.b) },
+  ];
+
+  return (
+    <div className="space-y-5 rounded-xl border border-line bg-paper p-5">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <div className="text-xs font-mono uppercase tracking-wider text-text-muted">Bayesian A/B Test</div>
+          <div className="mt-1 font-mono text-3xl font-bold text-text">
+            {probPct.toFixed(1)}% <span className="text-base font-normal text-text-muted">peluang variant menang</span>
+          </div>
+        </div>
+        <Badge signal={probPct >= 95 || probPct <= 5}>
+          {probPct >= 95 ? "Kuat: Variant" : probPct <= 5 ? "Kuat: Control" : "Belum Jelas"}
+        </Badge>
+      </div>
+
+      {/* probability meter, reusing the signal/noise duotone but for P(variant wins) */}
+      <div className="w-full">
+        <div className="relative h-3 w-full overflow-hidden rounded-full bg-paper-raised ring-1 ring-line">
+          <div className="absolute inset-y-0 left-0 h-full" style={{ width: `${probPct}%`, background: "linear-gradient(90deg, var(--color-control-dim), var(--color-variant))" }} />
+        </div>
+        <div className="mt-1.5 flex items-center justify-between text-xs font-mono text-text-faint">
+          <span>0% (Control lebih baik)</span>
+          <span>100% (Variant lebih baik)</span>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 gap-4 border-t border-line pt-4 sm:grid-cols-4">
+        <div>
+          <div className="text-xs font-mono uppercase text-text-muted">Rate Control</div>
+          <div className="font-mono text-lg text-control">{(result.controlRate * 100).toFixed(2)}%</div>
+        </div>
+        <div>
+          <div className="text-xs font-mono uppercase text-text-muted">Rate Variant</div>
+          <div className="font-mono text-lg text-variant">{(result.variantRate * 100).toFixed(2)}%</div>
+        </div>
+        <div>
+          <div className="text-xs font-mono uppercase text-text-muted">Expected Uplift</div>
+          <div className="font-mono text-lg text-text">{result.expectedUplift >= 0 ? "+" : ""}{result.expectedUplift.toFixed(2)}%</div>
+        </div>
+        <div>
+          <div className="text-xs font-mono uppercase text-text-muted">Expected Loss</div>
+          <div className="font-mono text-sm text-text">
+            V: {(result.expectedLossChoosingVariant * 100).toFixed(3)}pp
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div className="mb-1.5 text-xs font-mono uppercase tracking-wider text-text-muted">Distribusi Posterior (Beta)</div>
+        <DistributionChart curves={curves} xFormat={(v) => `${(v * 100).toFixed(1)}%`} />
+      </div>
+
+      <div>
+        <div className="mb-1.5 text-xs font-mono uppercase tracking-wider text-text-muted">Credible Interval 95%</div>
+        <ForestPlot
+          xFormat={(v) => `${(v * 100).toFixed(1)}%`}
+          rows={[
+            { label: "Control", estimate: result.controlRate, ci: result.controlCI, color: "var(--color-control)" },
+            { label: "Variant", estimate: result.variantRate, ci: result.variantCI, color: "var(--color-variant)" },
+          ]}
+        />
+      </div>
+
+      <p className="border-t border-line pt-3 text-xs leading-relaxed text-text-faint">
+        Beda dari uji frequentist, di sini tidak ada "signifikan/tidak" biner — cuma probabilitas. <strong>Expected loss</strong> menunjukkan
+        rata-rata kerugian (dalam poin persen) kalau kamu pilih variant ternyata control yang lebih baik, atau sebaliknya. Dihitung dari{" "}
+        {result.samples.toLocaleString("id-ID")} simulasi Monte Carlo atas posterior Beta({result.posteriorControl.a.toFixed(0)},{result.posteriorControl.b.toFixed(0)})
+        vs Beta({result.posteriorVariant.a.toFixed(0)},{result.posteriorVariant.b.toFixed(0)}).
+      </p>
+    </div>
+  );
+}
+
+function betaCurvePoints(a, b, n = 80) {
+  const points = [];
+  for (let i = 0; i <= n; i++) {
+    const x = i / n;
+    points.push({ x, y: betaPDF(Math.min(0.999, Math.max(0.001, x)), a, b) });
+  }
+  return points;
+}
+
+
 function AuthScreen() {
   const [mode, setMode] = useState("signin");
   const [email, setEmail] = useState("");
@@ -336,7 +733,25 @@ function SaveDialog({ onSave, onClose, saving }) {
 // TAB 1 — KALKULATOR
 // ============================================================================
 function CalculatorTab({ userId }) {
-  const [testMode, setTestMode] = useState("proportion");
+  const [groupMode, setGroupMode] = useState("two");
+  return (
+    <div className="space-y-6">
+      <Segmented
+        value={groupMode}
+        onChange={setGroupMode}
+        options={[
+          { value: "two", label: "2 Grup" },
+          { value: "multi", label: "Multi-Varian (3+)" },
+        ]}
+      />
+      {groupMode === "two" ? <TwoGroupCalculator userId={userId} /> : <MultiVariantCalculator userId={userId} />}
+    </div>
+  );
+}
+
+// ---- 2-group calculator: z-test / t-test / Mann-Whitney / Bayesian ---------
+function TwoGroupCalculator({ userId }) {
+  const [method, setMethod] = useState("proportion");
   const [alpha, setAlpha] = useState(0.05);
 
   const [cConv, setCConv] = useState("120");
@@ -353,18 +768,28 @@ function CalculatorTab({ userId }) {
   const [saving, setSaving] = useState(false);
   const [saveMsg, setSaveMsg] = useState("");
 
+  const usesProportionInput = method === "proportion" || method === "bayesian";
+
   function runTest() {
     setError("");
     try {
-      if (testMode === "proportion") {
+      if (usesProportionInput) {
         const cc = Number(cConv), ct = Number(cTotal), vc = Number(vConv), vt = Number(vTotal);
         if (!ct || !vt || cc > ct || vc > vt || cc < 0 || vc < 0) throw new Error("Periksa lagi angka konversi & total — konversi tidak boleh melebihi total.");
-        setResult(twoProportionZTest({ controlConversions: cc, controlTotal: ct, variantConversions: vc, variantTotal: vt, alpha }));
+        if (method === "proportion") {
+          setResult(twoProportionZTest({ controlConversions: cc, controlTotal: ct, variantConversions: vc, variantTotal: vt, alpha }));
+        } else {
+          setResult(bayesianProportionTest({ controlConversions: cc, controlTotal: ct, variantConversions: vc, variantTotal: vt }));
+        }
       } else {
         const control = cData.split(/[\n,]+/).map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
         const variant = vData.split(/[\n,]+/).map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n));
         if (control.length < 2 || variant.length < 2) throw new Error("Butuh minimal 2 data poin di masing-masing grup.");
-        setResult(welchTTest({ control, variant, alpha }));
+        if (method === "continuous") {
+          setResult(welchTTest({ control, variant, alpha }));
+        } else {
+          setResult(mannWhitneyU({ control, variant, alpha }));
+        }
       }
     } catch (e) {
       setError(e.message);
@@ -375,7 +800,7 @@ function CalculatorTab({ userId }) {
   async function handleSave({ name, hypothesis }) {
     setSaving(true);
     try {
-      const input = testMode === "proportion"
+      const input = usesProportionInput
         ? { controlConversions: Number(cConv), controlTotal: Number(cTotal), variantConversions: Number(vConv), variantTotal: Number(vTotal) }
         : { control: cData, variant: vData };
       const { error } = await supabase.from("experiments").insert({
@@ -396,27 +821,38 @@ function CalculatorTab({ userId }) {
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <Segmented
-          value={testMode}
-          onChange={(v) => { setTestMode(v); setResult(null); }}
+          value={method}
+          onChange={(v) => { setMethod(v); setResult(null); setError(""); }}
           options={[
-            { value: "proportion", label: "Uji Proporsi" },
-            { value: "continuous", label: "Uji Rata-rata" },
+            { value: "proportion", label: "Proporsi (Z-Test)" },
+            { value: "continuous", label: "Rata-rata (T-Test)" },
+            { value: "mannwhitney", label: "Non-Parametrik" },
+            { value: "bayesian", label: "Bayesian" },
           ]}
         />
-        <Field label="Signifikansi (α)">
-          <select
-            value={alpha}
-            onChange={(e) => setAlpha(Number(e.target.value))}
-            className="rounded-md border border-line bg-paper px-3 py-1.5 font-mono text-sm text-text focus:border-control focus:outline-none"
-          >
-            <option value={0.01}>0.01</option>
-            <option value={0.05}>0.05</option>
-            <option value={0.10}>0.10</option>
-          </select>
-        </Field>
+        {method !== "bayesian" && (
+          <Field label="Signifikansi (α)">
+            <select
+              value={alpha}
+              onChange={(e) => setAlpha(Number(e.target.value))}
+              className="rounded-md border border-line bg-paper px-3 py-1.5 font-mono text-sm text-text focus:border-control focus:outline-none"
+            >
+              <option value={0.01}>0.01</option>
+              <option value={0.05}>0.05</option>
+              <option value={0.10}>0.10</option>
+            </select>
+          </Field>
+        )}
       </div>
 
-      {testMode === "proportion" ? (
+      <p className="text-xs text-text-faint">
+        {method === "proportion" && "Uji signifikansi untuk metrik conversion rate — cocok kalau data kamu berupa jumlah konversi dari total user."}
+        {method === "continuous" && "Uji signifikansi untuk metrik kontinu (revenue, waktu, dsb) — mengasumsikan data mendekati distribusi normal."}
+        {method === "mannwhitney" && "Alternatif non-parametrik dari uji rata-rata — tidak mengasumsikan distribusi normal, tahan terhadap outlier."}
+        {method === "bayesian" && "Menghasilkan probabilitas langsung ('X% peluang variant menang') dan expected loss, bukan p-value biner."}
+      </p>
+
+      {usesProportionInput ? (
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-3 rounded-xl border border-line bg-paper p-4">
             <div className="flex items-center gap-2 text-sm font-semibold text-control"><span className="h-2 w-2 rounded-full bg-control" />Control</div>
@@ -462,7 +898,174 @@ function CalculatorTab({ userId }) {
         {saveMsg && <span className="text-sm text-signal">{saveMsg}</span>}
       </div>
 
-      <ResultPanel result={result} />
+      {result && method === "mannwhitney" && <MannWhitneyResultPanel result={result} />}
+      {result && method === "bayesian" && <BayesianResultPanel result={result} />}
+      {result && (method === "proportion" || method === "continuous") && <ResultPanel result={result} />}
+
+      {showSave && <SaveDialog onClose={() => setShowSave(false)} onSave={handleSave} saving={saving} />}
+    </div>
+  );
+}
+
+// ---- Multi-variant calculator: chi-square (proportion) / ANOVA (continuous) --
+let groupIdCounter = 0;
+function newGroupId() { groupIdCounter += 1; return `g${groupIdCounter}`; }
+function groupLabel(i) { return String.fromCharCode(65 + i); } // A, B, C, ...
+
+function MultiVariantCalculator({ userId }) {
+  const [method, setMethod] = useState("chisquare");
+  const [alpha, setAlpha] = useState(0.05);
+
+  const [propGroups, setPropGroups] = useState([
+    { id: newGroupId(), name: "A", conv: "80", total: "800" },
+    { id: newGroupId(), name: "B", conv: "95", total: "800" },
+    { id: newGroupId(), name: "C", conv: "110", total: "800" },
+  ]);
+  const [contGroups, setContGroups] = useState([
+    { id: newGroupId(), name: "A", data: "20.1\n21.3\n19.8\n22.0\n20.5" },
+    { id: newGroupId(), name: "B", data: "22.5\n23.1\n21.8\n24.0\n22.9" },
+    { id: newGroupId(), name: "C", data: "24.8\n25.2\n24.1\n26.0\n25.5" },
+  ]);
+
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState("");
+  const [showSave, setShowSave] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState("");
+
+  const groups = method === "chisquare" ? propGroups : contGroups;
+  const setGroups = method === "chisquare" ? setPropGroups : setContGroups;
+
+  function addGroup() {
+    if (groups.length >= 6) return;
+    const i = groups.length;
+    setGroups([...groups, method === "chisquare"
+      ? { id: newGroupId(), name: groupLabel(i), conv: "100", total: "800" }
+      : { id: newGroupId(), name: groupLabel(i), data: "21.0\n22.0\n20.5\n21.5\n22.5" }]);
+  }
+  function removeGroup(id) {
+    if (groups.length <= 2) return;
+    setGroups(groups.filter((g) => g.id !== id));
+  }
+  function updateGroup(id, patch) {
+    setGroups(groups.map((g) => (g.id === id ? { ...g, ...patch } : g)));
+  }
+
+  function runTest() {
+    setError("");
+    try {
+      if (method === "chisquare") {
+        const parsed = propGroups.map((g) => ({ name: g.name || "?", conversions: Number(g.conv), total: Number(g.total) }));
+        if (parsed.some((g) => !g.total || g.conversions > g.total || g.conversions < 0)) {
+          throw new Error("Periksa lagi angka konversi & total di tiap grup.");
+        }
+        setResult(chiSquareTest({ groups: parsed, alpha }));
+      } else {
+        const parsed = contGroups.map((g) => ({
+          name: g.name || "?",
+          data: g.data.split(/[\n,]+/).map((s) => Number(s.trim())).filter((n) => !Number.isNaN(n)),
+        }));
+        if (parsed.some((g) => g.data.length < 2)) throw new Error("Tiap grup butuh minimal 2 data poin.");
+        setResult(oneWayANOVA({ groups: parsed, alpha }));
+      }
+    } catch (e) {
+      setError(e.message);
+      setResult(null);
+    }
+  }
+
+  async function handleSave({ name, hypothesis }) {
+    setSaving(true);
+    try {
+      const { error } = await supabase.from("experiments").insert({
+        user_id: userId, name, hypothesis, test_type: result.testType, input: { groups }, result,
+      });
+      if (error) throw error;
+      setShowSave(false);
+      setSaveMsg("Tersimpan ke riwayat ✓");
+      setTimeout(() => setSaveMsg(""), 3000);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <Segmented
+          value={method}
+          onChange={(v) => { setMethod(v); setResult(null); setError(""); }}
+          options={[
+            { value: "chisquare", label: "Proporsi (Chi-Square)" },
+            { value: "anova", label: "Rata-rata (ANOVA)" },
+          ]}
+        />
+        <Field label="Signifikansi (α)">
+          <select value={alpha} onChange={(e) => setAlpha(Number(e.target.value))}
+            className="rounded-md border border-line bg-paper px-3 py-1.5 font-mono text-sm text-text focus:border-control focus:outline-none">
+            <option value={0.01}>0.01</option>
+            <option value={0.05}>0.05</option>
+            <option value={0.10}>0.10</option>
+          </select>
+        </Field>
+      </div>
+
+      <p className="text-xs text-text-faint">
+        {method === "chisquare"
+          ? "Bandingkan conversion rate di 3 varian atau lebih sekaligus (A/B/C/D...) — chi-square cuma bilang 'ada beda' atau 'tidak', bukan pasangan mana yang beda."
+          : "Bandingkan rata-rata metrik kontinu di 3 varian atau lebih sekaligus."}
+      </p>
+
+      <div className="space-y-3">
+        {groups.map((g) => (
+          <div key={g.id} className="rounded-xl border border-line bg-paper p-4">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <input
+                value={g.name}
+                onChange={(e) => updateGroup(g.id, { name: e.target.value })}
+                className="w-32 rounded-md border border-line bg-ink px-2 py-1 text-sm font-semibold text-text focus:border-control focus:outline-none"
+              />
+              {groups.length > 2 && (
+                <button onClick={() => removeGroup(g.id)} className="text-text-faint hover:text-noise"><Minus size={16} /></button>
+              )}
+            </div>
+            {method === "chisquare" ? (
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Konversi"><TextInput type="number" value={g.conv} onChange={(e) => updateGroup(g.id, { conv: e.target.value })} /></Field>
+                <Field label="Total"><TextInput type="number" value={g.total} onChange={(e) => updateGroup(g.id, { total: e.target.value })} /></Field>
+              </div>
+            ) : (
+              <Field label="Data (satu angka per baris)">
+                <textarea value={g.data} onChange={(e) => updateGroup(g.id, { data: e.target.value })} rows={4}
+                  className="w-full rounded-md border border-line bg-ink px-3 py-2 font-mono text-sm text-text focus:border-control focus:outline-none focus:ring-1 focus:ring-control" />
+              </Field>
+            )}
+          </div>
+        ))}
+        {groups.length < 6 && (
+          <button onClick={addGroup} className="flex items-center gap-2 rounded-lg border border-dashed border-line px-4 py-2 text-sm text-text-muted hover:border-control hover:text-control">
+            <Plus size={15} /> Tambah Grup
+          </button>
+        )}
+      </div>
+
+      {error && <p className="flex items-center gap-2 text-sm text-noise"><AlertCircle size={15} />{error}</p>}
+
+      <div className="flex flex-wrap items-center gap-3">
+        <button onClick={runTest} className="rounded-lg bg-control px-5 py-2.5 text-sm font-semibold text-ink hover:opacity-90">
+          Hitung
+        </button>
+        {result && (
+          <button onClick={() => setShowSave(true)} className="flex items-center gap-2 rounded-lg border border-line px-4 py-2.5 text-sm text-text hover:border-control">
+            <Save size={15} /> Simpan ke Riwayat
+          </button>
+        )}
+        {saveMsg && <span className="text-sm text-signal">{saveMsg}</span>}
+      </div>
+
+      {result && <MultiVariantResultPanel result={result} />}
 
       {showSave && <SaveDialog onClose={() => setShowSave(false)} onSave={handleSave} saving={saving} />}
     </div>
@@ -698,6 +1301,64 @@ function UploadTab({ userId }) {
 // ============================================================================
 // TAB 4 — RIWAYAT
 // ============================================================================
+const TEST_TYPE_LABEL = {
+  proportion: "Proporsi (Z-Test)",
+  continuous: "Rata-rata (T-Test)",
+  mannwhitney: "Non-Parametrik (Mann-Whitney)",
+  bayesian: "Bayesian A/B",
+  chisquare: "Multi-Varian (Chi-Square)",
+  anova: "Multi-Varian (ANOVA)",
+};
+
+function HistoryResultPanel({ result }) {
+  if (result.testType === "mannwhitney") return <MannWhitneyResultPanel result={result} />;
+  if (result.testType === "bayesian") return <BayesianResultPanel result={result} />;
+  if (result.testType === "chisquare" || result.testType === "anova") return <MultiVariantResultPanel result={result} />;
+  return <ResultPanel result={result} />;
+}
+
+function HistoryBadge({ result }) {
+  if (result.testType === "bayesian") {
+    const pct = result.probVariantBeatsControl * 100;
+    return <Badge signal={pct >= 95 || pct <= 5}>{pct.toFixed(1)}% menang</Badge>;
+  }
+  return <Badge signal={result.significant}>p={result.pValue < 0.0001 ? result.pValue.toExponential(1) : result.pValue.toFixed(4)}</Badge>;
+}
+
+// Trend of p-values across saved experiments over time (frequentist tests only —
+// Bayesian results don't have a p-value, so they're excluded from this view).
+function TrendChart({ points }) {
+  const W = 400, H = 150, PL = 34, PR = 10, PT = 14, PB = 24;
+  const innerW = W - PL - PR, innerH = H - PT - PB;
+  const times = points.map((p) => p.date.getTime());
+  const tMin = Math.min(...times), tMax = Math.max(...times);
+  const yMax = Math.max(0.12, ...points.map((p) => p.pValue)) * 1.1;
+  const sx = (t) => PL + ((t - tMin) / ((tMax - tMin) || 1)) * innerW;
+  const sy = (y) => PT + innerH - (y / yMax) * innerH;
+  const alphaY = sy(0.05);
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full" style={{ height: 160 }}>
+      <line x1={PL} y1={PT} x2={PL} y2={PT + innerH} stroke="var(--color-line)" strokeWidth="1" />
+      <line x1={PL} y1={PT + innerH} x2={W - PR} y2={PT + innerH} stroke="var(--color-line)" strokeWidth="1" />
+      <line x1={PL} y1={alphaY} x2={W - PR} y2={alphaY} stroke="var(--color-text-faint)" strokeWidth="1" strokeDasharray="3,3" />
+      <text x={W - PR} y={alphaY - 3} fontSize="8" fontFamily="var(--font-mono)" fill="var(--color-text-faint)" textAnchor="end">α = 0.05</text>
+      <text x={2} y={PT + 4} fontSize="8" fontFamily="var(--font-mono)" fill="var(--color-text-faint)">{yMax.toFixed(2)}</text>
+      <text x={2} y={PT + innerH} fontSize="8" fontFamily="var(--font-mono)" fill="var(--color-text-faint)">0</text>
+      {points.length > 1 && (
+        <path
+          d={pathFromPoints(points.map((p) => ({ x: sx(p.date.getTime()), y: sy(p.pValue) })))}
+          fill="none" stroke="var(--color-text-faint)" strokeWidth="1"
+        />
+      )}
+      {points.map((p, i) => (
+        <circle key={i} cx={sx(p.date.getTime())} cy={sy(p.pValue)} r="4"
+          fill={p.significant ? "var(--color-signal)" : "var(--color-noise)"} />
+      ))}
+    </svg>
+  );
+}
+
 function HistoryTab({ userId }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -732,35 +1393,52 @@ function HistoryTab({ userId }) {
     </div>
   );
 
+  const trendPoints = items
+    .filter((i) => typeof i.result.pValue === "number")
+    .map((i) => ({ date: new Date(i.created_at), pValue: i.result.pValue, significant: i.result.significant }))
+    .sort((a, b) => a.date - b.date);
+
   return (
-    <div className="space-y-3">
-      {items.map((item) => {
-        const isOpen = expandedId === item.id;
-        return (
-          <div key={item.id} className="overflow-hidden rounded-xl border border-line bg-paper">
-            <button onClick={() => setExpandedId(isOpen ? null : item.id)} className="flex w-full items-center justify-between gap-3 p-4 text-left">
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-sm font-medium text-text">{item.name}</div>
-                <div className="mt-0.5 font-mono text-xs text-text-faint">
-                  {new Date(item.created_at).toLocaleDateString("id-ID", { day: "numeric", month: "short", year: "numeric" })}
-                  {" · "}{item.test_type === "proportion" ? "Uji Proporsi" : "Uji Rata-rata"}
-                </div>
-              </div>
-              <Badge signal={item.result.significant}>p={item.result.pValue < 0.0001 ? item.result.pValue.toExponential(1) : item.result.pValue.toFixed(4)}</Badge>
-              {isOpen ? <ChevronDown size={18} className="shrink-0 text-text-muted" /> : <ChevronRight size={18} className="shrink-0 text-text-muted" />}
-            </button>
-            {isOpen && (
-              <div className="border-t border-line p-4">
-                {item.hypothesis && <p className="mb-4 text-sm italic text-text-muted">"{item.hypothesis}"</p>}
-                <ResultPanel result={item.result} />
-                <button onClick={() => handleDelete(item.id)} className="mt-4 flex items-center gap-2 text-xs text-noise hover:opacity-80">
-                  <Trash2 size={13} /> Hapus eksperimen ini
-                </button>
-              </div>
-            )}
+    <div className="space-y-6">
+      {trendPoints.length >= 2 && (
+        <div className="rounded-xl border border-line bg-paper p-5">
+          <div className="mb-1.5 flex items-center gap-2 text-xs font-mono uppercase tracking-wider text-text-muted">
+            <TrendingUp size={13} /> Trend p-value dari waktu ke waktu
           </div>
-        );
-      })}
+          <TrendChart points={trendPoints} />
+          <p className="mt-1 text-xs text-text-faint">Titik hijau = signifikan, titik merah = belum. (Uji Bayesian tidak ikut ditampilkan di sini karena tidak punya p-value.)</p>
+        </div>
+      )}
+
+      <div className="space-y-3">
+        {items.map((item) => {
+          const isOpen = expandedId === item.id;
+          return (
+            <div key={item.id} className="overflow-hidden rounded-xl border border-line bg-paper">
+              <button onClick={() => setExpandedId(isOpen ? null : item.id)} className="flex w-full items-center justify-between gap-3 p-4 text-left">
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-medium text-text">{item.name}</div>
+                  <div className="mt-0.5 font-mono text-xs text-text-faint">
+                    {new Date(item.created_at).toLocaleDateString("id-ID", { day: "numeric", month: "short", year: "numeric" })}
+                    {" · "}{TEST_TYPE_LABEL[item.test_type] || item.test_type}
+                  </div>
+                </div>
+                <HistoryBadge result={item.result} />
+                {isOpen ? <ChevronDown size={18} className="shrink-0 text-text-muted" /> : <ChevronRight size={18} className="shrink-0 text-text-muted" />}
+              </button>
+              {isOpen && (
+                <div className="border-t border-line p-4">
+                  {item.hypothesis && <p className="mb-4 text-sm italic text-text-muted">"{item.hypothesis}"</p>}
+                  <HistoryResultPanel result={item.result} />
+                  <button onClick={() => handleDelete(item.id)} className="mt-4 flex items-center gap-2 text-xs text-noise hover:opacity-80">
+                    <Trash2 size={13} /> Hapus eksperimen ini
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -769,7 +1447,7 @@ function HistoryTab({ userId }) {
 // ROOT APP — sidebar shell + auth gate
 // ============================================================================
 const NAV = [
-  { id: "calculator", label: "Kalkulator", icon: Calculator, desc: "Uji signifikansi A/B" },
+  { id: "calculator", label: "Kalkulator", icon: Calculator, desc: "6 metode uji: Z-test, T-test, Mann-Whitney, Bayesian, Chi-Square, ANOVA" },
   { id: "samplesize", label: "Sample Size", icon: Target, desc: "Hitung sampel & power" },
   { id: "upload", label: "Upload CSV", icon: Upload, desc: "Analisis data mentah" },
   { id: "history", label: "Riwayat", icon: History, desc: "Eksperimen tersimpan" },
