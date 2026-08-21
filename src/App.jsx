@@ -3,7 +3,7 @@ import Papa from "papaparse";
 import {
   FlaskConical, Calculator, Target, Upload, History, LogOut,
   ChevronRight, ChevronDown, Trash2, AlertCircle, CheckCircle2,
-  Loader2, Save, X, Plus, Minus, TrendingUp,
+  Loader2, Save, X, Plus, Minus, TrendingUp, Sparkles,
 } from "lucide-react";
 import { supabase } from "./lib/supabaseClient";
 import {
@@ -283,7 +283,72 @@ function StripPlot({ control, variant }) {
 }
 
 
-function ResultPanel({ result }) {
+// Calls /api/analyze (a Vercel serverless function that proxies to Gemini,
+// keeping the API key server-side) and shows a plain-language interpretation
+// of the result on demand — opt-in, since it costs an API call.
+function AIAnalysisBlock({ result, hypothesis }) {
+  const [state, setState] = useState("idle"); // idle | loading | done | error
+  const [analysis, setAnalysis] = useState("");
+  const [error, setError] = useState("");
+
+  async function runAnalysis() {
+    setState("loading");
+    setError("");
+    try {
+      const res = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ result, hypothesis }),
+      });
+      let data;
+      try {
+        data = await res.json();
+      } catch {
+        throw new Error("Endpoint /api/analyze tidak merespons dengan benar — fitur ini butuh `vercel dev` atau sudah di-deploy ke Vercel, tidak jalan lewat `npm run dev` biasa.");
+      }
+      if (!res.ok) throw new Error(data.error || "Gagal memuat analisis AI.");
+      setAnalysis(data.analysis);
+      setState("done");
+    } catch (e) {
+      setError(e.message);
+      setState("error");
+    }
+  }
+
+  return (
+    <div className="border-t border-line pt-4">
+      {state === "idle" && (
+        <button
+          onClick={runAnalysis}
+          className="flex items-center gap-2 rounded-lg border border-line px-4 py-2 text-sm text-text hover:border-control"
+        >
+          <Sparkles size={15} className="text-control" /> Analisis dengan AI
+        </button>
+      )}
+      {state === "loading" && (
+        <div className="flex items-center gap-2 text-sm text-text-muted">
+          <Loader2 size={15} className="animate-spin" /> Menganalisis hasil…
+        </div>
+      )}
+      {state === "error" && (
+        <div className="space-y-2">
+          <p className="flex items-start gap-2 text-sm text-noise"><AlertCircle size={15} className="mt-0.5 shrink-0" />{error}</p>
+          <button onClick={runAnalysis} className="text-xs text-control hover:underline">Coba lagi</button>
+        </div>
+      )}
+      {state === "done" && (
+        <div className="rounded-lg border border-control/30 bg-control-dim/20 p-4">
+          <div className="mb-2 flex items-center gap-1.5 text-xs font-mono uppercase tracking-wider text-control">
+            <Sparkles size={13} /> Analisis AI (Gemini)
+          </div>
+          <p className="text-sm leading-relaxed text-text">{analysis}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ResultPanel({ result, hypothesis }) {
   if (!result) return null;
   const isProp = result.testType === "proportion";
   return (
@@ -369,12 +434,14 @@ function ResultPanel({ result }) {
           ? `Perbedaan antara control dan variant kemungkinan besar bukan kebetulan (p < α = ${result.alpha}). Cukup bukti untuk menolak hipotesis nol.`
           : `Belum cukup bukti statistik untuk menyimpulkan ada perbedaan nyata (p ≥ α = ${result.alpha}). Bisa jadi efeknya kecil, atau sampel belum cukup besar — lihat tab Sample Size.`}
       </p>
+
+      <AIAnalysisBlock key={JSON.stringify(result)} result={result} hypothesis={hypothesis} />
     </div>
   );
 }
 
 // Multi-variant result panel — shared by chi-square (proportion) and ANOVA (continuous)
-function MultiVariantResultPanel({ result }) {
+function MultiVariantResultPanel({ result, hypothesis }) {
   const isChiSq = result.testType === "chisquare";
   const palette = ["var(--color-control)", "var(--color-variant)", "#a78bfa", "#f472b6", "#34d399", "#fbbf24"];
   const rows = result.groups.map((g, i) => ({
@@ -466,11 +533,13 @@ function MultiVariantResultPanel({ result }) {
           ? `Ada perbedaan signifikan di antara ${result.groups.length} grup ini (p < α = ${result.alpha}). ${isChiSq ? "Chi-square" : "ANOVA"} cuma bilang "ada beda", untuk tau grup mana vs mana lakukan uji lanjutan (post-hoc) atau bandingkan 2 grup langsung di tab Uji Proporsi/Rata-rata.`
           : `Belum cukup bukti ada perbedaan nyata di antara grup-grup ini (p ≥ α = ${result.alpha}).`}
       </p>
+
+      <AIAnalysisBlock key={JSON.stringify(result)} result={result} hypothesis={hypothesis} />
     </div>
   );
 }
 
-function MannWhitneyResultPanel({ result }) {
+function MannWhitneyResultPanel({ result, hypothesis }) {
   return (
     <div className="space-y-5 rounded-xl border border-line bg-paper p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -515,11 +584,13 @@ function MannWhitneyResultPanel({ result }) {
           ? `Ranking kedua grup berbeda signifikan (p < α = ${result.alpha}).`
           : `Belum cukup bukti perbedaan ranking antar grup (p ≥ α = ${result.alpha}).`}
       </p>
+
+      <AIAnalysisBlock key={JSON.stringify(result)} result={result} hypothesis={hypothesis} />
     </div>
   );
 }
 
-function BayesianResultPanel({ result }) {
+function BayesianResultPanel({ result, hypothesis }) {
   const probPct = result.probVariantBeatsControl * 100;
   const curves = [
     { label: "Control", color: "var(--color-control)", points: betaCurvePoints(result.posteriorControl.a, result.posteriorControl.b) },
@@ -594,6 +665,8 @@ function BayesianResultPanel({ result }) {
         {result.samples.toLocaleString("id-ID")} simulasi Monte Carlo atas posterior Beta({result.posteriorControl.a.toFixed(0)},{result.posteriorControl.b.toFixed(0)})
         vs Beta({result.posteriorVariant.a.toFixed(0)},{result.posteriorVariant.b.toFixed(0)}).
       </p>
+
+      <AIAnalysisBlock key={JSON.stringify(result)} result={result} hypothesis={hypothesis} />
     </div>
   );
 }
@@ -754,13 +827,13 @@ function TwoGroupCalculator({ userId }) {
   const [method, setMethod] = useState("proportion");
   const [alpha, setAlpha] = useState(0.05);
 
-  const [cConv, setCConv] = useState("120");
-  const [cTotal, setCTotal] = useState("1000");
-  const [vConv, setVConv] = useState("150");
-  const [vTotal, setVTotal] = useState("1000");
+  const [cConv, setCConv] = useState("");
+  const [cTotal, setCTotal] = useState("");
+  const [vConv, setVConv] = useState("");
+  const [vTotal, setVTotal] = useState("");
 
-  const [cData, setCData] = useState("20.1\n21.3\n19.8\n22.0\n20.5\n21.1\n19.9\n20.7");
-  const [vData, setVData] = useState("22.5\n23.1\n21.8\n24.0\n22.9\n23.4\n22.1\n23.6");
+  const [cData, setCData] = useState("");
+  const [vData, setVData] = useState("");
 
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
@@ -856,13 +929,13 @@ function TwoGroupCalculator({ userId }) {
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-3 rounded-xl border border-line bg-paper p-4">
             <div className="flex items-center gap-2 text-sm font-semibold text-control"><span className="h-2 w-2 rounded-full bg-control" />Control</div>
-            <Field label="Jumlah Konversi"><TextInput type="number" value={cConv} onChange={(e) => setCConv(e.target.value)} /></Field>
-            <Field label="Total Visitor / User"><TextInput type="number" value={cTotal} onChange={(e) => setCTotal(e.target.value)} /></Field>
+            <Field label="Jumlah Konversi"><TextInput type="number" placeholder="cth. 120" value={cConv} onChange={(e) => setCConv(e.target.value)} /></Field>
+            <Field label="Total Visitor / User"><TextInput type="number" placeholder="cth. 1000" value={cTotal} onChange={(e) => setCTotal(e.target.value)} /></Field>
           </div>
           <div className="space-y-3 rounded-xl border border-line bg-paper p-4">
             <div className="flex items-center gap-2 text-sm font-semibold text-variant"><span className="h-2 w-2 rounded-full bg-variant" />Variant</div>
-            <Field label="Jumlah Konversi"><TextInput type="number" value={vConv} onChange={(e) => setVConv(e.target.value)} /></Field>
-            <Field label="Total Visitor / User"><TextInput type="number" value={vTotal} onChange={(e) => setVTotal(e.target.value)} /></Field>
+            <Field label="Jumlah Konversi"><TextInput type="number" placeholder="cth. 150" value={vConv} onChange={(e) => setVConv(e.target.value)} /></Field>
+            <Field label="Total Visitor / User"><TextInput type="number" placeholder="cth. 1000" value={vTotal} onChange={(e) => setVTotal(e.target.value)} /></Field>
           </div>
         </div>
       ) : (
@@ -871,17 +944,20 @@ function TwoGroupCalculator({ userId }) {
             <div className="flex items-center gap-2 text-sm font-semibold text-control"><span className="h-2 w-2 rounded-full bg-control" />Control</div>
             <Field label="Data (satu angka per baris)">
               <textarea value={cData} onChange={(e) => setCData(e.target.value)} rows={8}
-                className="w-full rounded-md border border-line bg-ink px-3 py-2 font-mono text-sm text-text focus:border-control focus:outline-none focus:ring-1 focus:ring-control" />
+                placeholder={"cth.\n20.1\n21.3\n19.8\n22.0\n20.5"}
+                className="w-full rounded-md border border-line bg-ink px-3 py-2 font-mono text-sm text-text placeholder:text-text-faint focus:border-control focus:outline-none focus:ring-1 focus:ring-control" />
             </Field>
           </div>
           <div className="space-y-3 rounded-xl border border-line bg-paper p-4">
             <div className="flex items-center gap-2 text-sm font-semibold text-variant"><span className="h-2 w-2 rounded-full bg-variant" />Variant</div>
             <Field label="Data (satu angka per baris)">
               <textarea value={vData} onChange={(e) => setVData(e.target.value)} rows={8}
-                className="w-full rounded-md border border-line bg-ink px-3 py-2 font-mono text-sm text-text focus:border-control focus:outline-none focus:ring-1 focus:ring-control" />
+                placeholder={"cth.\n22.5\n23.1\n21.8\n24.0\n22.9"}
+                className="w-full rounded-md border border-line bg-ink px-3 py-2 font-mono text-sm text-text placeholder:text-text-faint focus:border-control focus:outline-none focus:ring-1 focus:ring-control" />
             </Field>
           </div>
         </div>
+
       )}
 
       {error && <p className="flex items-center gap-2 text-sm text-noise"><AlertCircle size={15} />{error}</p>}
@@ -917,14 +993,14 @@ function MultiVariantCalculator({ userId }) {
   const [alpha, setAlpha] = useState(0.05);
 
   const [propGroups, setPropGroups] = useState([
-    { id: newGroupId(), name: "A", conv: "80", total: "800" },
-    { id: newGroupId(), name: "B", conv: "95", total: "800" },
-    { id: newGroupId(), name: "C", conv: "110", total: "800" },
+    { id: newGroupId(), name: "A", conv: "", total: "" },
+    { id: newGroupId(), name: "B", conv: "", total: "" },
+    { id: newGroupId(), name: "C", conv: "", total: "" },
   ]);
   const [contGroups, setContGroups] = useState([
-    { id: newGroupId(), name: "A", data: "20.1\n21.3\n19.8\n22.0\n20.5" },
-    { id: newGroupId(), name: "B", data: "22.5\n23.1\n21.8\n24.0\n22.9" },
-    { id: newGroupId(), name: "C", data: "24.8\n25.2\n24.1\n26.0\n25.5" },
+    { id: newGroupId(), name: "A", data: "" },
+    { id: newGroupId(), name: "B", data: "" },
+    { id: newGroupId(), name: "C", data: "" },
   ]);
 
   const [result, setResult] = useState(null);
@@ -940,8 +1016,8 @@ function MultiVariantCalculator({ userId }) {
     if (groups.length >= 6) return;
     const i = groups.length;
     setGroups([...groups, method === "chisquare"
-      ? { id: newGroupId(), name: groupLabel(i), conv: "100", total: "800" }
-      : { id: newGroupId(), name: groupLabel(i), data: "21.0\n22.0\n20.5\n21.5\n22.5" }]);
+      ? { id: newGroupId(), name: groupLabel(i), conv: "", total: "" }
+      : { id: newGroupId(), name: groupLabel(i), data: "" }]);
   }
   function removeGroup(id) {
     if (groups.length <= 2) return;
@@ -1033,13 +1109,14 @@ function MultiVariantCalculator({ userId }) {
             </div>
             {method === "chisquare" ? (
               <div className="grid grid-cols-2 gap-3">
-                <Field label="Konversi"><TextInput type="number" value={g.conv} onChange={(e) => updateGroup(g.id, { conv: e.target.value })} /></Field>
-                <Field label="Total"><TextInput type="number" value={g.total} onChange={(e) => updateGroup(g.id, { total: e.target.value })} /></Field>
+                <Field label="Konversi"><TextInput type="number" placeholder="cth. 100" value={g.conv} onChange={(e) => updateGroup(g.id, { conv: e.target.value })} /></Field>
+                <Field label="Total"><TextInput type="number" placeholder="cth. 800" value={g.total} onChange={(e) => updateGroup(g.id, { total: e.target.value })} /></Field>
               </div>
             ) : (
               <Field label="Data (satu angka per baris)">
                 <textarea value={g.data} onChange={(e) => updateGroup(g.id, { data: e.target.value })} rows={4}
-                  className="w-full rounded-md border border-line bg-ink px-3 py-2 font-mono text-sm text-text focus:border-control focus:outline-none focus:ring-1 focus:ring-control" />
+                  placeholder={"cth.\n21.0\n22.0\n20.5\n21.5"}
+                  className="w-full rounded-md border border-line bg-ink px-3 py-2 font-mono text-sm text-text placeholder:text-text-faint focus:border-control focus:outline-none focus:ring-1 focus:ring-control" />
               </Field>
             )}
           </div>
@@ -1076,8 +1153,8 @@ function MultiVariantCalculator({ userId }) {
 // TAB 2 — SAMPLE SIZE & POWER
 // ============================================================================
 function SampleSizeTab() {
-  const [baseline, setBaseline] = useState("10");
-  const [mde, setMde] = useState("20");
+  const [baseline, setBaseline] = useState("");
+  const [mde, setMde] = useState("");
   const [mdeType, setMdeType] = useState("relative");
   const [alpha, setAlpha] = useState(0.05);
   const [power, setPower] = useState(0.8);
@@ -1101,11 +1178,11 @@ function SampleSizeTab() {
     <div className="space-y-6">
       <div className="grid gap-4 rounded-xl border border-line bg-paper p-5 sm:grid-cols-2">
         <Field label="Baseline Conversion Rate (%)" hint="Conversion rate saat ini, sebelum eksperimen">
-          <TextInput type="number" value={baseline} onChange={(e) => setBaseline(e.target.value)} />
+          <TextInput type="number" placeholder="cth. 10" value={baseline} onChange={(e) => setBaseline(e.target.value)} />
         </Field>
         <Field label="Minimum Detectable Effect" hint={mdeType === "relative" ? "Persentase kenaikan RELATIF, mis. 20% dari 10% → 12%" : "Kenaikan ABSOLUT dalam poin persen"}>
           <div className="flex gap-2">
-            <TextInput type="number" value={mde} onChange={(e) => setMde(e.target.value)} />
+            <TextInput type="number" placeholder="cth. 20" value={mde} onChange={(e) => setMde(e.target.value)} />
             <select value={mdeType} onChange={(e) => setMdeType(e.target.value)} className="rounded-md border border-line bg-ink px-2 text-xs font-mono text-text-muted focus:outline-none">
               <option value="relative">% relatif</option>
               <option value="absolute">pp absolut</option>
@@ -1310,11 +1387,11 @@ const TEST_TYPE_LABEL = {
   anova: "Multi-Varian (ANOVA)",
 };
 
-function HistoryResultPanel({ result }) {
-  if (result.testType === "mannwhitney") return <MannWhitneyResultPanel result={result} />;
-  if (result.testType === "bayesian") return <BayesianResultPanel result={result} />;
-  if (result.testType === "chisquare" || result.testType === "anova") return <MultiVariantResultPanel result={result} />;
-  return <ResultPanel result={result} />;
+function HistoryResultPanel({ result, hypothesis }) {
+  if (result.testType === "mannwhitney") return <MannWhitneyResultPanel result={result} hypothesis={hypothesis} />;
+  if (result.testType === "bayesian") return <BayesianResultPanel result={result} hypothesis={hypothesis} />;
+  if (result.testType === "chisquare" || result.testType === "anova") return <MultiVariantResultPanel result={result} hypothesis={hypothesis} />;
+  return <ResultPanel result={result} hypothesis={hypothesis} />;
 }
 
 function HistoryBadge({ result }) {
@@ -1429,7 +1506,7 @@ function HistoryTab({ userId }) {
               {isOpen && (
                 <div className="border-t border-line p-4">
                   {item.hypothesis && <p className="mb-4 text-sm italic text-text-muted">"{item.hypothesis}"</p>}
-                  <HistoryResultPanel result={item.result} />
+                  <HistoryResultPanel result={item.result} hypothesis={item.hypothesis} />
                   <button onClick={() => handleDelete(item.id)} className="mt-4 flex items-center gap-2 text-xs text-noise hover:opacity-80">
                     <Trash2 size={13} /> Hapus eksperimen ini
                   </button>
