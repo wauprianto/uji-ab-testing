@@ -1,5 +1,20 @@
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash-lite";
+// ============================================================================
+// /api/analyze — Vercel Serverless Function
+//
+// Proxies a "explain this A/B test result" request to the Gemini API. Runs
+// server-side so GEMINI_API_KEY never reaches the browser (unlike a
+// VITE_-prefixed env var, which gets bundled into client JS and is visible
+// to anyone who opens devtools).
+//
+// Local testing: `npm run dev` alone does NOT serve this route (Vite doesn't
+// know about /api). Use `vercel dev` instead — see README.md.
+// ============================================================================
 
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+
+// Turn a stats.js result object into a compact, human-readable summary the
+// model can reason over — deliberately not just JSON.stringify(result), so
+// the prompt stays short and the model can't misinterpret field names.
 function summarizeResult(result) {
   const pct = (x) => `${(x * 100).toFixed(2)}%`;
 
@@ -75,7 +90,7 @@ ${hypothesis ? `\nHipotesis eksperimen: "${hypothesis}"\n` : "\n"}
 Ringkasan hasil uji:
 ${summary}
 
-Tulis interpretasi singkat dalam Bahasa Indonesia yang mencakup:
+Tulis interpretasi singkat dalam Bahasa Indonesia (maksimal 120 kata, tanpa heading atau bullet point, satu paragraf mengalir) yang mencakup:
 1. Apa arti hasil ini secara bisnis/praktis — jangan mengulang angka statistik yang sudah ada di ringkasan
 2. Rekomendasi tindakan konkret
 3. Satu catatan kehati-hatian kalau relevan (misalnya ukuran sampel kecil, atau perlu data lebih banyak sebelum yakin)
@@ -90,25 +105,10 @@ Jangan mengarang angka yang tidak ada di ringkasan di atas.`;
         headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.4, maxOutputTokens: 1025 },
+          generationConfig: { temperature: 0.4, maxOutputTokens: 1024 },
         }),
       }
     );
-
-const candidate = data?.candidates?.[0];
-const text = candidate?.content?.parts?.map((p) => p.text).join("") || "";
-
-if (!text) {
-  res.status(502).json({ error: "Gemini tidak mengembalikan hasil teks (mungkin diblokir safety filter)." });
-  return;
-}
-
-if (candidate?.finishReason === "MAX_TOKENS") {
-  console.warn("Gemini response terpotong karena maxOutputTokens kurang.");
-}
-
-res.status(200).json({ analysis: text.trim() });
-
 
     if (!geminiRes.ok) {
       const errText = await geminiRes.text();
@@ -118,10 +118,15 @@ res.status(200).json({ analysis: text.trim() });
     }
 
     const data = await geminiRes.json();
-    const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
+    const candidate = data?.candidates?.[0];
+    const text = candidate?.content?.parts?.map((p) => p.text).join("") || "";
     if (!text) {
       res.status(502).json({ error: "Gemini tidak mengembalikan hasil teks (mungkin diblokir safety filter)." });
       return;
+    }
+
+    if (candidate?.finishReason === "MAX_TOKENS") {
+      console.warn("Gemini response terpotong karena maxOutputTokens kurang.");
     }
 
     res.status(200).json({ analysis: text.trim() });
