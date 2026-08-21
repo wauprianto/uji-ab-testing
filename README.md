@@ -1,12 +1,13 @@
 # UJI — A/B Testing & Experiment Analysis Toolkit
 
 Toolkit web untuk menjalankan dan menyimpan analisis eksperimen A/B: uji signifikansi,
-sample size / power calculator, upload CSV data mentah, dan riwayat eksperimen tersimpan.
+sample size / power calculator, upload CSV data mentah, analisis hasil pakai AI (Gemini),
+dan riwayat eksperimen tersimpan.
 
-**Stack:** React + Vite, Tailwind CSS v4, Supabase (Auth + Postgres). Semua perhitungan
-statistik (two-proportion z-test, Welch's t-test, sample size calculator) diimplementasi
-manual di `src/lib/stats.js` — tidak pakai library black-box, jadi setiap angka bisa
-ditelusuri ke rumusnya.
+**Stack:** React + Vite, Tailwind CSS v4, Supabase (Auth + Postgres), Vercel Serverless
+Function + Gemini API (analisis AI). Semua perhitungan statistik (6 metode uji + sample
+size calculator) diimplementasi manual di `src/lib/stats.js` — tidak pakai library
+black-box, jadi setiap angka bisa ditelusuri ke rumusnya.
 
 ---
 
@@ -25,26 +26,65 @@ ditelusuri ke rumusnya.
 5. **Opsional tapi disarankan:** di **Authentication → Providers**, matikan "Confirm email"
    kalau mau testing cepat tanpa verifikasi email dulu.
 
-## 2. Jalankan secara lokal
+## 2. Setup Fitur Analisis AI (Gemini)
+
+Fitur ini (tombol "Analisis dengan AI" di tiap hasil uji) jalan lewat Vercel Serverless
+Function (`api/analyze.js`) yang manggil Gemini API di sisi server — jadi API key-nya
+**tidak pernah** sampai ke browser. Kalau kamu skip bagian ini, sisa aplikasi tetap
+berfungsi normal, cuma tombol "Analisis dengan AI" yang gak akan jalan.
+
+1. Buka [Google AI Studio](https://aistudio.google.com/apikey), sign in, klik **Create API key**.
+   Key baru yang dibuat sekarang otomatis jadi "auth key" (bukan "standard key" lama yang
+   mulai September 2026 diblokir Google) — jadi gak perlu langkah migrasi tambahan.
+2. Simpan API key itu. **Jangan** taruh di `.env` biasa dengan prefix `VITE_` — itu akan
+   ke-bundle ke JS dan kelihatan siapa saja yang buka DevTools browser.
+3. **Untuk deploy (Vercel):** masuk ke Project Settings → Environment Variables, tambahkan:
+   ```
+   GEMINI_API_KEY=isi-api-key-kamu
+   ```
+   (Opsional) `GEMINI_MODEL` kalau mau override model default — lihat catatan di bawah.
+4. **Untuk testing lokal:** buat file `.env.local` di root project (terpisah dari `.env`,
+   sudah otomatis di-gitignore), isi:
+   ```
+   GEMINI_API_KEY=isi-api-key-kamu
+   ```
+   Lalu jalankan pakai **Vercel CLI**, bukan `npm run dev` biasa — soalnya `/api/analyze`
+   itu serverless function yang cuma dikenali Vercel, Vite gak tau route itu ada:
+   ```bash
+   npm install -g vercel
+   vercel link      # sekali saja, hubungkan folder ini ke project Vercel kamu
+   vercel dev
+   ```
+
+**Catatan soal nama model:** Google sering ganti-ganti nama model Gemini (dalam beberapa
+bulan terakhir saja sudah dari `gemini-2.0-flash` → `gemini-2.5-flash` → seri `gemini-3.x-flash`).
+Kalau default di kode (`gemini-3.5-flash`) sudah usang pas kamu baca ini, override lewat
+env var `GEMINI_MODEL` tanpa perlu ubah kode — cek nama model terbaru di
+[ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models).
+
+## 3. Jalankan secara lokal
 
 ```bash
 npm install
 npm run dev
 ```
 
-Buka `http://localhost:5173`.
+Buka `http://localhost:5173`. (Tombol "Analisis dengan AI" tidak akan berfungsi lewat cara
+ini — perlu `vercel dev`, lihat bagian 2 di atas.)
 
-## 3. Deploy ke Vercel
+## 4. Deploy ke Vercel
 
 ```bash
 npm install -g vercel   # kalau belum ada
 vercel
 ```
 
-Saat deploy, tambahkan environment variables yang sama (`VITE_SUPABASE_URL`,
-`VITE_SUPABASE_ANON_KEY`) di dashboard Vercel → Project Settings → Environment Variables.
+Saat deploy, tambahkan environment variables di dashboard Vercel → Project Settings →
+Environment Variables:
+- `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY` — wajib
+- `GEMINI_API_KEY` — wajib kalau mau fitur Analisis AI aktif (opsional: `GEMINI_MODEL`)
 
-## 4. Format CSV untuk fitur Upload
+## 5. Format CSV untuk fitur Upload
 
 Data level-user, satu baris per user/sesi:
 
@@ -75,6 +115,8 @@ src/
   lib/
     stats.js           # engine statistik (6 metode uji + sample size + CSV summarizer)
     supabaseClient.js  # koneksi Supabase
+api/
+  analyze.js           # Vercel Serverless Function — proxy ke Gemini API (server-side)
 supabase/
   schema.sql                        # skema tabel + RLS policies (project baru)
   migration_001_add_test_types.sql  # jalankan ini kalau project Supabase-nya sudah lama ada
@@ -110,6 +152,15 @@ Semua grafik dibuat pakai SVG murni (tanpa library charting) di `src/App.jsx`:
 - **Forest Plot** — titik estimasi + confidence/credible interval, dipakai di semua metode
 - **Strip Plot** — sebaran data mentah untuk Mann-Whitney (sesuai prinsip non-parametrik: tidak mengasumsikan bentuk kurva)
 - **Trend Chart** — riwayat p-value dari eksperimen tersimpan dari waktu ke waktu (tab Riwayat)
+
+## Analisis AI
+
+Tombol "Analisis dengan AI" di tiap hasil uji mengirim ringkasan hasil (bukan data mentah)
+ke Gemini lewat `/api/analyze.js`, minta interpretasi bisnis singkat dalam Bahasa Indonesia
+(maks. 120 kata): apa artinya hasil ini, rekomendasi tindakan, dan catatan kehati-hatian
+kalau relevan. Ini pelengkap opsional di atas interpretasi rule-based yang sudah selalu
+tampil otomatis di tiap panel — bukan pengganti, karena rule-based tidak butuh API call
+dan selalu tersedia meski `GEMINI_API_KEY` belum di-setup.
 
 ## Kalau kamu sudah pernah setup Supabase sebelumnya
 
